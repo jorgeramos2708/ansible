@@ -1,0 +1,169 @@
+---
+- name: Playbook de hardening para servidores Linux
+  hosts: produccion    # Aplica a todos los hosts de produccion definidos en el archivo de inventory
+  become: true    # Ejecutar tareas como usuario root (sudo).
+  vars:
+    # Define aquí las variables de configuración deseadas
+    ssh_port: "2222"
+    allowed_users: "admin"   # Solo el usuario admin tendra acceso por el puerto 2222. Se pueden agregar mas usuarios separando por un espacio (ej: admin jose luis)
+  # allowed_groups: "administrators"   # Permite el acceso a un grupo o grupos en especifico
+
+  tasks:
+    # 1. Actualización de seguridad del sistema
+    - name: Actualizar todos los paquetes del sistema (Debian/Ubuntu)
+      apt:
+        upgrade: safe     # Equivalente a apt upgrade
+        update_cache: yes     # Equivalente a apt update
+      when: ansible_facts["os_family"] == "Debian"    # Valida que el sistema operativo del servidor sea de la familia Debian
+
+    - name: Actualizar todos los paquetes del sistema (RHEL/AlmaLinux/Rocky)
+      dnf:
+        name: "*"    # Actualiza TODOS los paquetes instalados en el sistema
+        state: latest    # Instala la ultima version disponible de los paquetes
+      when: ansible_facts["os_family"] == "RedHat"    # Valida que el sistema operativo del servidor sea de la familia RedHat
+
+    # 2. Configuración de seguridad SSH
+    - name: Configurar el puerto SSH personalizado
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Port\b'
+        line: "Port {{ ssh_port }}"
+      notify: Reiniciar SSH
+
+    - name: Permitir a SSH escuchar en el puerto personalizado en SELinux
+      community.general.seport:
+        ports: "{{ ssh_port }}"
+        proto: tcp
+        setype: ssh_port_t
+        state: present
+      when: ansible_facts["os_family"] == "RedHat"
+
+    - name: Deshabilitar el acceso root por SSH
+      lineinfile:    # Este modulo busca una línea específica dentro de un archivo de texto y la deja tal cual esta
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'    # Busca desde el principio de esta linea, sin importar que haya un '#'
+        line: 'PermitRootLogin no'    # Cambia de 'yes' a 'no' si aplica
+      notify: Reiniciar SSH
+
+    - name: Deshabilitar la autenticación por contraseña por SSH    # Fuerza a utilizar llaves SSH y no contraseñas
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: Reiniciar SSH
+
+    - name: Restringir acceso SSH solo a usuarios permitidos
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?AllowUsers'
+      # regexp: '^#?AllowGroups'
+        line: "AllowUsers {{ allowed_users }}"
+      # line: "AllowGroups {{ allowed_groups }}"
+      notify: Reiniciar SSH
+
+    - name: Configurar tiempo de espera por inactividad en SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?ClientAliveInterval'
+        line: 'ClientAliveInterval 300'    # Establecer 5 minutos de tiempo de inactividad para cerrar la sesion
+      notify: Reiniciar SSH
+
+    - name: Configurar máximo de recuentos vivos de clientes SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?ClientAliveCountMax'
+        line: 'ClientAliveCountMax 0'    # Intentos de respuesta del cliente antes de cerrar la sesion
+      notify: Reiniciar SSH
+
+    - name: Configurar banner de advertencia legal en SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Banner'
+        line: 'Banner /etc/issue.net'
+      notify: Reiniciar SSH
+
+    - name: Deshabilitar X11Forwarding en SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?X11Forwarding'
+        line: 'X11Forwarding no'
+      notify: Reiniciar SSH
+
+    - name: Establecer contenido del banner de advertencia
+      copy:
+        dest: /etc/issue.net
+        content: |
+          ********************************************************************
+          * ¡ACCESO RESTRINGIDO! Este sistema es para uso exclusivo de      *
+          * personal autorizado. Todo el trafico esta siendo monitoreado.   *
+          ********************************************************************
+
+    # 3. Control de red y firewall
+    - name: Validar que el firewall UFW esta activo (Debian/Ubuntu)
+      ufw:
+        state: enabled    # Habilita el servicio ufw
+        policy: deny    # Bloquea TODO el trafico si no hay una regla explicita que lo permita
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Permitir puerto SSH en UFW
+      ufw:   # Servicio de firewall de Debian
+        rule: allow    # Aplica una regla para permitir trafico
+        port: "{{ ssh_port }}"   # Permite el trafico al puerto 2222
+        proto: tcp    # Especifica que el puerto SSH utilice el protocolo TCP
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Valida que Firewalld esta activo (RHEL/CentOS)
+      systemd:    # Gestor de servicios internos de RedHat
+        name: firewalld    # Servicio de firewall de RedHat
+        state: started     # Inicia el servicio
+        enabled: yes    # Arranca automaticamente despues de un reinicio
+      when: ansible_facts["os_family"] == "RedHat"
+
+    - name: Permitir puerto SSH personalizado en Firewalld
+      firewalld:
+        port: "{{ ssh_port }}/tcp"   # Permite el trafico por el puerto 2222
+        permanent: yes   # Se guarda la regla de manera persistente
+        immediate: yes   # Aplica la regla inmediatamente
+        state: enabled   # Habilita la regla
+      when: ansible_facts["os_family"] == "RedHat"
+
+    # 4. Aseguramiento de parámetros del kernel (sysctl)
+    - name: Deshabilitar reenvío de paquetes IP (IP forwarding)
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '0'    # Apaga el IP forwarding, evitando que el servidor funcione como puente para enrutar trafico malicioso
+        state: present    # Escribe la configuracion en el disco para que quede persistente ante reinicios
+        reload: yes    # Aplica el cambio en caliente, sin necesidad de reiniciar
+
+    - name: Ignorar paquetes ICMP al broadcast
+      sysctl:
+        name: net.ipv4.icmp_echo_ignore_broadcasts
+        value: '1'   # Ignora ping dirigidos al broadcast, evitando un ataque smurf
+        state: present
+        reload: yes
+
+    - name: Deshabilitar sistemas de archivos no utilizados y obsoletos
+      modprobe:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - freevxfs
+        - jffs2
+        - hfs
+        - hfsplus
+
+    - name: Prevenir permanentemente la carga de filesystems obsoletos
+      copy:
+        dest: "/etc/modprobe.d/{{ item }}.conf"
+        content: "install {{ item }} /bin/true\n"
+      loop:
+        - freevxfs
+        - jffs2
+        - hfs
+        - hfsplus
+
+  handlers:
+    - name: Reiniciar SSH
+      service:
+        name: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"    # Si el servidor es Debian/Ubuntu, el servicio se llama ssh; si es RedHat, se llama sshd
+        state: restarted
